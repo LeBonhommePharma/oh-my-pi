@@ -55,6 +55,12 @@ omp-sync.sh --rollback <id>         # restore a specific snapshot
 `--check` is the safe default for cron: it never writes snapshots or replaces
 the binary. `--apply` is the mutating path.
 
+`--plugins` / `-l` is **rejected** after `--` (exit 1). Core `omp update`
+dispatches `--plugins` to the plugin upgrade path and ignores `--check`, so
+forwarding it would make `--check` mutate plugin state and make `--apply`
+upgrade plugins twice — neither of which this wrapper snapshots or rolls back.
+Run `omp update --plugins` directly instead.
+
 ## Snapshot location
 
 Snapshots live **only** under the sync root:
@@ -90,7 +96,9 @@ After a **successful** apply, older snapshots are pruned so at most
 - **No machine-specific paths.** Home is `$HOME`. There are no hard-coded
   user home directories.
 - **Locking.** Concurrent runs are rejected (`flock` when available, otherwise
-  a directory lock). Exit code 5.
+  a directory lock). Exit code 5. A stale directory lock (owner PID gone) is
+  claimed by renaming it away — only one racer's rename can succeed, so a
+  lock a second process has just acquired is never deleted.
 - **Fail-soft network.** Registry/DNS/TLS/timeouts during `--check` or apply
   exit 2 and leave the existing launcher in place (apply restores the snapshot
   if the updater had already started).
@@ -104,7 +112,10 @@ After a **successful** apply, older snapshots are pruned so at most
   stays new) even though the script still reports a successful restore.
 - **Best-effort rollback target.** Restore overwrites the file `omp` on
   `PATH` currently resolves to (symlink targets are followed at restore time,
-  so a retargeted launcher is not left pointing at the new binary).
+  so a retargeted launcher is not left pointing at the new binary). If a failed
+  update deleted the launcher outright or left a dangling symlink, restore
+  falls back to the launcher/source paths recorded in the snapshot `meta`, so
+  the binary comes back even when `omp` no longer resolves on `PATH`.
   Homebrew/mise installs that `omp update` itself drives are unchanged; this
   wrapper does not fight those managers. Nix-managed installs are
   detection-only (`omp update` refuses to replace them).
@@ -126,6 +137,7 @@ After a **successful** apply, older snapshots are pruned so at most
 | `OMP_SYNC_BIN` | Launcher to wrap (default: `omp` on `PATH`) |
 | `OMP_SYNC_KEEP` | Snapshots to keep after a successful apply (default 5) |
 | `OMP_SYNC_RELINK_EXT` | Colon-separated local plugin directories passed to `omp plugin link` after a successful apply. Missing paths are skipped; link failures are warnings and do **not** roll back. A `~/` prefix is treated as a literal tilde (not expanded by the matcher) and then replaced with `$HOME`. |
+| `OMP_SYNC_NO_FLOCK` | Set to force the portable directory lock even when `flock` exists (used by the tests). |
 | `OMP_SYNC_SMOKE_CMD` | Shell command run after a successful `omp update`. Non-zero exit restores the previous binary. Keep this generic (for example `omp --version` or your own health check). |
 
 `OMP_SYNC_RELINK_EXT` is for **your** local plugins. It is not a place to
@@ -166,8 +178,9 @@ Official update behavior, channels, and install methods remain documented on
 
 The wrapper is covered by a fake-`omp` contract script (no network, no real
 install). It checks snapshot/rollback, network fail-soft (including apply),
-smoke-command restore, snapshot prune, incomplete-snapshot rejection, and that
-user config is never deleted:
+smoke-command restore, snapshot prune, incomplete-snapshot rejection,
+`--plugins` rejection, restore after an update that deletes the launcher,
+stale-lock takeover, and that user config is never deleted:
 
 ```sh
 sh contrib/omp-sync/omp-sync.test.sh

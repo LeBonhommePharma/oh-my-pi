@@ -94,6 +94,11 @@ if [ "\$MODE" = "fail" ]; then
 	printf 'Update failed: boom\n' >&2
 	exit 1
 fi
+if [ "\$MODE" = "delete" ]; then
+	rm -f "\$0"
+	printf 'Update failed after removing the launcher\n' >&2
+	exit 1
+fi
 if [ "\$MODE" = "net-apply" ]; then
 	printf 'Failed to check for updates: fetch failed\n' >&2
 	exit 1
@@ -490,6 +495,63 @@ else
 	got=$("$FAKE_OMP" --version)
 	assert_eq "SIGTERM apply does not finish update" "$got" "omp/1.0.0"
 fi
+
+# --plugins / -l are rejected instead of being forwarded (they ignore --check
+# and mutate plugin state outside anything this wrapper snapshots)
+write_fake_omp "$FAKE_OMP" "1.0.0" current
+rm -f "$(dirname "$FAKE_OMP")/state/check-args"
+rc=$(run_sync --check -- --plugins)
+assert_eq "check -- --plugins exits 1" "$rc" "1"
+if [ -f "$(dirname "$FAKE_OMP")/state/check-args" ]; then
+	printf 'not ok  check -- --plugins never invoked omp\n'
+	FAILED=$((FAILED + 1))
+else
+	printf 'ok  check -- --plugins never invoked omp\n'
+fi
+rc=$(run_sync --apply -- -l)
+assert_eq "apply -- -l exits 1" "$rc" "1"
+rc=$(run_sync --apply -- -fl)
+assert_eq "apply -- -fl (cluster) exits 1" "$rc" "1"
+rc=$(run_sync --apply -- --force)
+assert_eq "apply -- --force still accepted" "$rc" "0"
+
+# a failed update that deletes the launcher still restores from the snapshot
+DEL_ROOT=$TEST_HOME/deleted
+mkdir -p "$DEL_ROOT"
+write_fake_omp "$DEL_ROOT/omp" "1.0.0" delete
+FAKE_OMP=$DEL_ROOT/omp
+rc=$(run_sync --apply)
+assert_eq "apply that deletes launcher exits 3" "$rc" "3"
+assert_file "deleted launcher is restored" "$FAKE_OMP"
+got=$("$FAKE_OMP" --version)
+assert_eq "deleted launcher restored to previous version" "$got" "omp/1.0.0"
+
+# rollback works even when the launcher is missing and not on PATH
+rm -f "$FAKE_OMP"
+rc=$(run_sync --rollback)
+assert_eq "rollback with missing launcher exits 0" "$rc" "0"
+assert_file "rollback recreated the launcher" "$FAKE_OMP"
+got=$("$FAKE_OMP" --version)
+assert_eq "rollback with missing launcher restores 1.0.0" "$got" "omp/1.0.0"
+FAKE_OMP=$TEST_HOME/bin/omp
+
+# stale directory-lock takeover never deletes a live lock
+STALE_SYNC=$TEST_ROOT/stale-lock
+mkdir -p "$STALE_SYNC/omp-sync.lock.d"
+printf '%s\n' "999999" >"$STALE_SYNC/omp-sync.lock.d/pid"
+write_fake_omp "$FAKE_OMP" "1.0.0" current
+rc=$(
+	set +e
+	HOME=$TEST_HOME \
+		OMP_SYNC_DIR="$STALE_SYNC" \
+		OMP_SYNC_BIN=$FAKE_OMP \
+		OMP_SYNC_NO_FLOCK=1 \
+		"$SCRIPT" --list >/dev/null 2>&1
+	printf '%s\n' $?
+)
+assert_eq "stale directory lock is taken over" "$rc" "0"
+leftover=$(find "$STALE_SYNC" -maxdepth 1 -name 'omp-sync.lock.d*' 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "stale lock leaves no directories behind" "$leftover" "0"
 
 rm -rf "$TEST_ROOT"
 

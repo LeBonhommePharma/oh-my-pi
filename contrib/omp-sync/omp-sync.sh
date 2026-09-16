@@ -32,6 +32,7 @@ LOCK_KIND=""
 LOCK_DIR=""
 LOCK_FILE=""
 CHILD_PID=""
+RESTORED_PATH=""
 
 usage() {
 	cat <<'EOF'
@@ -49,6 +50,10 @@ Actions:
 Extra arguments after `--` are forwarded to `omp update` and to the apply
 preflight (`omp update --check`), preserving argument boundaries:
   omp-sync.sh --apply -- --canary
+
+`--plugins` / `-l` is rejected: it makes `omp update` upgrade plugins and
+ignore `--check`, which this wrapper cannot snapshot. Run `omp update
+--plugins` directly for that.
 
 Environment:
   HOME                 Used to resolve ~/.omp when the sync root is relative
@@ -190,7 +195,9 @@ acquire_lock() {
 	LOCK_FILE=$_root/omp-sync.lock
 	LOCK_DIR=$_root/omp-sync.lock.d
 
-	if command -v flock >/dev/null 2>&1; then
+	# OMP_SYNC_NO_FLOCK forces the portable directory lock (used by the tests to
+	# exercise that path on hosts that do have flock).
+	if [ -z "${OMP_SYNC_NO_FLOCK:-}" ] && command -v flock >/dev/null 2>&1; then
 		# Expand $LOCK_FILE at eval time so a quote/backtick in the path
 		# cannot break the redirect or run as shell source.
 		# shellcheck disable=SC2094
@@ -214,8 +221,15 @@ acquire_lock() {
 			die "$EX_LOCK" "another omp-sync process (pid $_old) holds $LOCK_DIR"
 		fi
 	fi
-	# Stale lock: take it over.
-	rm -rf "$LOCK_DIR" 2>/dev/null || true
+	# Stale lock: claim it atomically. `mv` of the lock directory succeeds for
+	# exactly one racer (the source disappears for the others), so a live lock
+	# created by the winner is never deleted by a loser that raced the same
+	# dead-PID check. Losers fall through to mkdir and get EX_LOCK below.
+	_stale=$LOCK_DIR.stale.$$
+	rm -rf "$_stale" 2>/dev/null || true
+	if mv "$LOCK_DIR" "$_stale" 2>/dev/null; then
+		rm -rf "$_stale" 2>/dev/null || true
+	fi
 	if mkdir "$LOCK_DIR" 2>/dev/null; then
 		printf '%s\n' "$$" >"$LOCK_DIR/pid"
 		LOCK_KIND=mkdir
@@ -259,6 +273,51 @@ resolve_file() {
 	fi
 	_dir=$(CDPATH='' cd -- "$(dirname "$_path")" && pwd -P)
 	printf '%s/%s\n' "$_dir" "$(basename "$_path")"
+}
+
+# Like resolve_file, but never exits: prints the final path a launcher points
+# at as long as its parent directory exists (so a dangling symlink left behind
+# by a half-finished update still yields a writable restore target).
+resolve_file_soft() {
+	_path=$1
+	_i=0
+	while [ -L "$_path" ] && [ "$_i" -lt 40 ]; do
+		_target=$(readlink "$_path") || return 1
+		case "$_target" in
+			/*) _path=$_target ;;
+			*) _path=$(dirname "$_path")/$_target ;;
+		esac
+		_i=$((_i + 1))
+	done
+	_dir=$(dirname "$_path")
+	[ -d "$_dir" ] || return 1
+	_dir=$(CDPATH='' cd -- "$_dir" && pwd -P) || return 1
+	printf '%s/%s\n' "$_dir" "$(basename "$_path")"
+}
+
+# Candidate launcher paths for a restore, most authoritative first:
+# the live launcher, then the launcher/source recorded in the snapshot. The
+# recorded fallbacks matter when a failed update deleted the PATH launcher --
+# exactly the case the snapshot exists for.
+restore_target() {
+	_meta=$1
+	_live=""
+	if [ -n "${OMP_SYNC_BIN:-}" ]; then
+		_live=$OMP_SYNC_BIN
+	else
+		_live=$(command -v omp 2>/dev/null || true)
+	fi
+	for _cand in "$_live" "$(read_meta_field "$_meta" launcher)" "$(read_meta_field "$_meta" source)"; do
+		[ -n "$_cand" ] || continue
+		case "$(basename "$_cand")" in
+			omp-sync.sh) continue ;;
+		esac
+		if _resolved=$(resolve_file_soft "$_cand"); then
+			printf '%s\n' "$_resolved"
+			return 0
+		fi
+	done
+	return 1
 }
 
 file_sha256() {
@@ -358,11 +417,13 @@ restore_snapshot() {
 	fi
 	# Overwrite the file PATH currently resolves to, not the possibly stale
 	# source recorded at snapshot time (an update may have retargeted a symlink).
-	_omp_cmd=$(resolve_omp)
-	_source=$(resolve_file "$_omp_cmd")
-	_parent=$(dirname "$_source")
-	if [ ! -d "$_parent" ]; then
-		die "$EX_ROLLBACK" "restore target directory missing: $_parent"
+	# If the launcher is gone entirely -- a failed update that removed it, or
+	# left a dangling symlink -- fall back to the paths recorded in the snapshot
+	# so restore still puts a working omp back.
+	_source=$(restore_target "$_dir/meta") ||
+		die "$EX_ROLLBACK" "no restorable omp launcher path for snapshot $_id"
+	if [ -d "$_source" ]; then
+		die "$EX_ROLLBACK" "restore target is a directory: $_source"
 	fi
 	_tmp=$_source.omp-sync-restore.$$
 	if ! cp -p "$_dir/omp" "$_tmp"; then
@@ -374,6 +435,7 @@ restore_snapshot() {
 		rm -f "$_tmp"
 		die "$EX_ROLLBACK" "could not replace $_source with snapshot $_id"
 	fi
+	RESTORED_PATH=$_source
 	log "omp-sync: restored $_source from snapshot $_id"
 }
 
@@ -582,7 +644,17 @@ cmd_apply() {
 		restore_and_fail "$_id" "omp update failed (exit $_upd_rc)"
 	fi
 
-	_after_bin=$(resolve_omp)
+	# A "successful" update that left no runnable launcher is still a failure:
+	# resolve softly so this restores instead of exiting EX_MISSING.
+	_after_bin=""
+	if [ -n "${OMP_SYNC_BIN:-}" ]; then
+		_after_bin=$OMP_SYNC_BIN
+	else
+		_after_bin=$(command -v omp 2>/dev/null || true)
+	fi
+	if [ -z "$_after_bin" ] || [ ! -e "$_after_bin" ]; then
+		restore_and_fail "$_id" "omp update left no runnable launcher"
+	fi
 	if ! "$_after_bin" --version >/dev/null 2>&1; then
 		restore_and_fail "$_id" "updated binary does not run --version"
 	fi
@@ -607,7 +679,10 @@ cmd_rollback() {
 		die "$EX_USAGE" "invalid snapshot id: $_id"
 	fi
 	restore_snapshot "$_id"
-	_omp=$(resolve_omp)
+	# Verify the file we just wrote, not `command -v omp`: after restoring a
+	# launcher the updater had deleted, PATH lookup may still be unresolvable
+	# even though the restore itself succeeded.
+	_omp=$RESTORED_PATH
 	if ! "$_omp" --version >/dev/null 2>&1; then
 		die "$EX_ROLLBACK" "restored binary does not run --version"
 	fi
@@ -638,6 +713,29 @@ cmd_list() {
 		log "omp-sync: no snapshots"
 	fi
 	exit "$EX_OK"
+}
+
+# `omp update --plugins` (`-l`) short-circuits to the plugin upgrade path and
+# ignores --check (packages/coding-agent/src/commands/update.ts), so forwarding
+# it would make --check mutate plugins and make --apply upgrade them twice
+# (once in the preflight, once for real) outside anything this wrapper can
+# snapshot or roll back. Reject it and point at the official command.
+reject_plugin_flag() {
+	case "$1" in
+		--plugins | --plugins=*)
+			die "$EX_USAGE" "--plugins is not forwardable (it upgrades plugins and ignores --check); run 'omp update --plugins' directly"
+			;;
+		--*) return 0 ;;
+		-*[!-]*)
+			# Short-flag cluster such as -l or -fl.
+			case "$1" in
+				*l*)
+					die "$EX_USAGE" "-l/--plugins is not forwardable (it upgrades plugins and ignores --check); run 'omp update --plugins' directly"
+					;;
+			esac
+			;;
+	esac
+	return 0
 }
 
 parse_args() {
@@ -684,6 +782,7 @@ parse_args() {
 				shift
 				PASS_THROUGH=""
 				while [ "$#" -gt 0 ]; do
+					reject_plugin_flag "$1"
 					PASS_THROUGH="$PASS_THROUGH $(quote_shell "$1")"
 					shift
 				done
